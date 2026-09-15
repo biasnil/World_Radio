@@ -22,7 +22,28 @@ USAGE:
 import tkinter as tk
 from tkinter import ttk
 
+from common.paths import resource_path
 from ui.app import WorldRadioApp
+
+
+def _set_app_icon(root):
+    """Sets the window/taskbar icon. iconphoto (PNG) works cross-platform
+    including Linux and macOS; iconbitmap additionally sets the crisper
+    Windows-specific .ico for the title bar there. Both are best-effort -
+    a missing or unreadable icon file shouldn't stop the app from
+    starting, just leave it with Tk's default icon."""
+    try:
+        icon_image = tk.PhotoImage(file=resource_path("assets/icon.png"))
+        root.iconphoto(True, icon_image)
+        root._icon_image_ref = icon_image  # keep a reference - Tk drops the icon if this gets garbage collected
+    except Exception:
+        pass
+
+    try:
+        if root.tk.call("tk", "windowingsystem") == "win32":
+            root.iconbitmap(resource_path("assets/icon.ico"))
+    except Exception:
+        pass
 
 
 def main():
@@ -33,6 +54,7 @@ def main():
             style.theme_use("clam")
     except Exception:
         pass
+    _set_app_icon(root)
     WorldRadioApp(root)
     root.mainloop()
 

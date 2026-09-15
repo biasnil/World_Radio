@@ -9,8 +9,11 @@ pulling in UI machinery.
 import json
 import os
 
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SETTINGS_FILE = os.path.join(_PROJECT_ROOT, "settings.json")
+from common.paths import app_base_dir
+
+# File lands next to main.py when running from source, or next to the
+# .exe when frozen (e.g. via PyInstaller) - see common/paths.py.
+SETTINGS_FILE = os.path.join(app_base_dir(), "settings.json")
 
 DARK = {
     "bg": "#151b26",

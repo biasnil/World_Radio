@@ -2,6 +2,8 @@
 
 import os
 
+from common.paths import app_base_dir
+
 # Known Radio Browser mirror servers. We try them in order until one responds.
 MIRRORS = [
     "https://de1.api.radio-browser.info",
@@ -17,10 +19,9 @@ HEADERS = {"User-Agent": "WorldRadioLocalApp/1.0"}
 # map tab still works offline afterwards.
 WORLD_GEOJSON_URL = "https://raw.githubusercontent.com/johan/world.geo.json/master/countries.geo.json"
 
-# Project root = parent of this common/ folder, so the cache file lands
-# next to main.py regardless of which module imports this constant.
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-WORLD_GEOJSON_CACHE = os.path.join(_PROJECT_ROOT, "countries.geo.json")
+# Cache file lands next to main.py when running from source, or next to
+# the .exe when frozen - see common/paths.py for why that split matters.
+WORLD_GEOJSON_CACHE = os.path.join(app_base_dir(), "countries.geo.json")
 
 # ISO 3166-1 alpha-2 -> display name, for turning country codes into readable labels.
 COUNTRY_CODE_NAMES = {
