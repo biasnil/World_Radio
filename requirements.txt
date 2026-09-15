@@ -1,0 +1,4 @@
+requests>=2.31
+python-vlc>=3.0.18000
+matplotlib>=3.7
+numpy>=1.24

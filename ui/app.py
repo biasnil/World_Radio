@@ -9,6 +9,7 @@ hands down to (or loads for) the station list and map widgets.
 """
 
 import threading
+import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
@@ -21,6 +22,7 @@ from ui.station_list_view import StationListView
 
 SEARCH_DEBOUNCE_MS = 450  # how long to wait after typing stops before auto-searching
 SETTINGS_SAVE_DEBOUNCE_MS = 800  # coalesces rapid changes (e.g. dragging the volume slider) into one write
+MIN_REPAINT_INTERVAL_SEC = 0.35  # caps how often a progressive load repaints the list/map while streaming in
 
 # Widgets that already use Space/Left/Right/etc. for their own purpose -
 # our global keyboard shortcuts below skip firing while one of these has
@@ -44,11 +46,15 @@ class WorldRadioApp:
         self.stations = []  # currently listed stations (list of dicts)
         self.current_station = None
         self._label_to_code = {}
+        self._sort_column = None
+        self._sort_reverse = False
         self._load_generation = 0  # bumped on every new load; stale background results are dropped
         self._search_debounce_id = None
         self._settings_save_id = None
         self._muted = bool(self.settings.get("muted", False))
         self._failed_station = None
+        self._station_cache = {}  # in-memory only - key -> station list, see _load_with_cache()
+        self._current_view_key = None  # the cache key behind whatever's currently shown, or None (Favorites/Recent)
 
         self.player = RadioPlayer(on_error=self._on_stream_error, on_playing=self._on_stream_playing)
 
@@ -56,7 +62,19 @@ class WorldRadioApp:
         self._apply_theme()
         self._bind_shortcuts()
         self._load_countries_async()
-        self._load_all_stations_async()
+
+        # If a filter was saved from last session, _populate_countries()
+        # will restore and re-run it once the country list (needed to
+        # resolve the saved country code to a label) arrives - starting
+        # the full, unfiltered catalog load here too would just mean two
+        # heavy loads racing each other at startup for no benefit, so
+        # skip it in that case.
+        has_saved_filter = bool(
+            self.settings.get("last_search") or self.settings.get("last_country_code")
+            or self.settings.get("last_tag")
+        )
+        if not has_saved_filter:
+            self._load_all_stations_async()
 
     # ---- UI construction ----------------------------------------------
 
@@ -97,10 +115,12 @@ class WorldRadioApp:
             top, text="Clear Filters", command=self._clear_filters, state="disabled"
         )
         self.clear_filters_btn.grid(row=0, column=8, padx=3)
+        self.refresh_btn = ttk.Button(top, text="⟳ Refresh", command=self._refresh_current, state="disabled")
+        self.refresh_btn.grid(row=0, column=9, padx=3)
 
-        top.columnconfigure(9, weight=1)  # spacer - pushes the settings gear to the right edge
+        top.columnconfigure(10, weight=1)  # spacer - pushes the settings gear to the right edge
         self.gear_btn = ttk.Button(top, text="⚙ Settings", command=self._open_settings_menu)
-        self.gear_btn.grid(row=0, column=10, sticky="e")
+        self.gear_btn.grid(row=0, column=11, sticky="e")
 
         ttk.Separator(self.root, orient="horizontal").pack(fill="x")
 
@@ -115,7 +135,7 @@ class WorldRadioApp:
 
         self.station_list = StationListView(
             list_tab, on_play_requested=self._play_index, on_hover_changed=self._on_station_hover,
-            on_selection_changed=self._on_list_selection_changed,
+            on_selection_changed=self._on_list_selection_changed, on_sort_requested=self._on_sort_requested,
         )
         self.map_view = MapView(map_tab, on_station_clicked=self._play_index, colors=self.colors)
 
@@ -318,6 +338,7 @@ class WorldRadioApp:
     def _load_favorites(self):
         self._clear_filter_fields()
         self._load_generation += 1  # invalidate any network load still in flight
+        self._set_current_view_key(None)  # nothing to refresh - this is just settings["favorites"], always live
         stations = list(self.settings.get("favorites", []))
         self._populate_stations(stations)
         if not stations:
@@ -326,6 +347,7 @@ class WorldRadioApp:
     def _load_recent(self):
         self._clear_filter_fields()
         self._load_generation += 1
+        self._set_current_view_key(None)
         stations = list(self.settings.get("recent", []))
         self._populate_stations(stations)
         if not stations:
@@ -341,9 +363,17 @@ class WorldRadioApp:
                 label_to_code = {f"{name} ({count})": code for name, code, count in countries}
                 self.root.after(0, lambda: self._populate_countries(labels, label_to_code))
             except Exception as e:
-                self.root.after(0, lambda: self.status_var.set(f"Could not load countries: {e}"))
+                self.root.after(0, lambda: self._on_countries_failed(e))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _on_countries_failed(self, error):
+        self.status_var.set(f"Could not load countries: {error}")
+        # If we were relying on this to resolve a saved country filter
+        # and skipped the startup catalog load as a result, fall back to
+        # it now rather than leaving the app empty.
+        if not self.stations:
+            self._load_all_stations_async()
 
     def _populate_countries(self, labels, label_to_code):
         self.country_combo["values"] = labels
@@ -370,7 +400,7 @@ class WorldRadioApp:
             self._trigger_search(save=False)
 
     def _load_top_stations_async(self):
-        self._load_stations_progressive(lambda on_batch: self.api.top_stations(limit=500), label="top stations")
+        self._load_with_cache(("top",), lambda on_batch: self.api.top_stations(limit=500), label="top stations")
 
     def _load_all_stations_async(self):
         """Loads the entire Radio Browser catalog (tens of thousands of
@@ -381,9 +411,57 @@ class WorldRadioApp:
         then subsequent pages of 1000 keep arriving and repainting the
         list/map as they come in, so there's always something on screen
         rather than a blank wait for the full catalog."""
-        self._load_stations_progressive(lambda on_batch: self.api.all_stations(on_batch=on_batch), label="stations")
+        self._load_with_cache(("all",), lambda on_batch: self.api.all_stations(on_batch=on_batch), label="stations")
 
-    def _load_stations_progressive(self, fetch_callable, label):
+    def _load_with_cache(self, key, fetch_callable, label):
+        """Reuses an already-fetched result for this exact view (same
+        Top/All/search+country+tag) instead of hitting the network again
+        - e.g. reselecting a country you already browsed this session, or
+        clicking "All Stations" twice, is instant. Cache is in-memory
+        only (cleared on restart) since the underlying data does change
+        over time; the ⟳ Refresh button bypasses it on purpose when you
+        want the current view's latest data."""
+        self._set_current_view_key(key)
+        cached = self._station_cache.get(key)
+        if cached is not None:
+            self._load_generation += 1  # drop any older network load still in flight for a different view
+            self._populate_stations(list(cached))
+            return
+        self._load_stations_progressive(fetch_callable, label, cache_key=key)
+
+    def _load_for_key(self, key):
+        """Reconstructs the right fetch_callable/label for a cache key -
+        used by _refresh_current() to re-issue whatever's on screen."""
+        if key == ("top",):
+            self._load_stations_progressive(
+                lambda on_batch: self.api.top_stations(limit=500), "top stations", cache_key=key
+            )
+        elif key == ("all",):
+            self._load_stations_progressive(
+                lambda on_batch: self.api.all_stations(on_batch=on_batch), "stations", cache_key=key
+            )
+        elif key[0] == "search":
+            _, name, countrycode, tag = key
+            self._load_stations_progressive(
+                lambda on_batch: self.api.search(name=name, countrycode=countrycode, tag=tag, on_batch=on_batch),
+                "matching stations", cache_key=key,
+            )
+
+    def _refresh_current(self):
+        """Re-fetches whatever's currently shown from the network,
+        bypassing (and replacing) any cached copy - for when you want
+        this session's cache to stop being used for this particular view."""
+        key = self._current_view_key
+        if key is None:
+            return  # Favorites/Recent - nothing cached to refresh, they're always live
+        self._station_cache.pop(key, None)
+        self._load_for_key(key)
+
+    def _set_current_view_key(self, key):
+        self._current_view_key = key
+        self.refresh_btn.config(state="normal" if key is not None else "disabled")
+
+    def _load_stations_progressive(self, fetch_callable, label, cache_key=None):
         """Runs fetch_callable(on_batch) in a background thread, where
         on_batch(stations_so_far) can be called zero or more times to
         repaint the list/map before the fetch finishes. Every call bumps
@@ -391,27 +469,53 @@ class WorldRadioApp:
         generation than the current one are silently dropped, so a fast
         second load (e.g. picking a different country right after
         another) can't have its results clobbered by the first one
-        finishing late."""
+        finishing late.
+
+        Repainting the list/map is expensive at a few thousand rows (the
+        Treeview gets fully cleared and rebuilt, the map's scatter data
+        recomputed), and pages can arrive much faster than that - so
+        actual repaints are throttled to once every MIN_REPAINT_INTERVAL_SEC
+        at most; batches in between just update the status count, which is
+        cheap. The very first batch and the final result always repaint,
+        so it never looks frozen at the start or stale at the end.
+
+        cache_key, if given, is where the final (non-partial) result gets
+        stored in self._station_cache once the load completes, for
+        _load_with_cache() to reuse later without hitting the network."""
         self._load_generation += 1
         gen = self._load_generation
         self.status_var.set(f"Loading {label}...")
+        last_repaint = {"t": 0.0}
 
         def on_batch(stations_so_far):
-            self.root.after(0, lambda: self._apply_load_result(gen, stations_so_far, True))
+            now = time.monotonic()
+            if last_repaint["t"] != 0.0 and now - last_repaint["t"] < MIN_REPAINT_INTERVAL_SEC:
+                count = len(stations_so_far)
+                self.root.after(0, lambda: self._apply_load_progress_text(gen, count))
+                return
+            last_repaint["t"] = now
+            self.root.after(0, lambda: self._apply_load_result(gen, stations_so_far, True, cache_key))
 
         def worker():
             try:
                 stations = fetch_callable(on_batch)
-                self.root.after(0, lambda: self._apply_load_result(gen, stations, False))
+                self.root.after(0, lambda: self._apply_load_result(gen, stations, False, cache_key))
             except Exception as e:
                 self.root.after(0, lambda: self._apply_load_error(gen, label, e))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _apply_load_result(self, gen, stations, still_loading):
+    def _apply_load_progress_text(self, gen, count):
+        if gen != self._load_generation:
+            return
+        self.status_var.set(f"{count:,} stations so far, loading more...")
+
+    def _apply_load_result(self, gen, stations, still_loading, cache_key=None):
         if gen != self._load_generation:
             return
         self._populate_stations(stations, still_loading=still_loading)
+        if not still_loading and cache_key is not None:
+            self._station_cache[cache_key] = stations
 
     def _apply_load_error(self, gen, label, error):
         if gen != self._load_generation:
@@ -462,7 +566,8 @@ class WorldRadioApp:
         # Selecting a country or typing a tag loads every matching
         # station (paginated), not a single capped page - same as "All
         # Stations", just filtered.
-        self._load_stations_progressive(
+        self._load_with_cache(
+            ("search", name, countrycode, tag),
             lambda on_batch: self.api.search(name=name, countrycode=countrycode, tag=tag, on_batch=on_batch),
             label="matching stations",
         )
@@ -533,6 +638,30 @@ class WorldRadioApp:
 
     def _on_list_selection_changed(self, _index):
         self._update_favorite_button()
+
+    def _on_sort_requested(self, column):
+        """The list view doesn't reorder itself (it only ever holds one
+        page of a potentially huge list, so there's no "just reorder
+        what's visible" option) - it reports the requested column and we
+        resort the actual underlying data, then repopulate everything
+        (list + map + highlights) consistently from the new order."""
+        if self._sort_column == column:
+            self._sort_reverse = not self._sort_reverse
+        else:
+            self._sort_column = column
+            self._sort_reverse = False
+
+        def sort_key(s):
+            if column == "bitrate":
+                try:
+                    return int(s.get("bitrate") or 0)
+                except (TypeError, ValueError):
+                    return -1
+            return str(s.get(column) or "").lower()
+
+        sorted_stations = sorted(self.stations, key=sort_key, reverse=self._sort_reverse)
+        self._populate_stations(sorted_stations)
+        self.station_list.set_sort_indicator(column, self._sort_reverse)
 
     def _refresh_playing_highlight(self):
         """Finds where the currently-playing station (if any) sits in the
